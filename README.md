@@ -1,2 +1,3 @@
 # cassandra-backup
-Tool to create snapshots for Cassandra
+
+Script to take snapshot of data and schema of all keyspaces in cassandra. This acts as local backups and if we enable, incremental backups in cassandra configuration, it will enable us to perform point in time recoveries.
