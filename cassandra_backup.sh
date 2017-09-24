@@ -1,10 +1,8 @@
 #!/bin/bash
 
 #
-# Description: Script to take snapshot of data and schema of all keyspaces in cassandra.
-# This acts as local backups and if we enable, incremental backups in cassandra configuration,
-# it will enable us to perform point in time recoveries.
 #
+# Script to take snapshots/backups and ship them to AWS S3
 #
 
 
@@ -35,81 +33,95 @@ function parse_yaml() {
         }' | sed 's/_=/+=/g'
 }
 
-DATE=`date +%Y%m%d%H%M%S`
-SNAME="snapshot-$DATE"
-SCHEMA_NAME="schema-$DATE"
-BACKUP_SNAPSHOT_DIR="/data/db/backups/snapshots"
-BACKUP_SCHEMA_DIR="/data/db/backups/schema"
+#Function to take a snapshot
+function take_snapshot() {
+	#Clear previous snapshots before taking a new one
+	$NODETOOL -h 127.0.0.1 clearsnapshot
+
+	if [[ $? != 0 ]]; then
+        	echo "Can't clear snapshots"
+        	exit
+	fi
+
+	# Take a snapshot
+	$NODETOOL -h 127.0.0.1 snapshot -t $SNAME
+
+	if [[ $? != 0 ]]; then
+        	echo "Can't take snapshots"
+        	exit
+	fi
+
+	#Parse cassandra configs to extract info on data directories. In our env, we've multiple data directories
+	eval $( parse_yaml "$CASSANDRA_CONFIG" )
+
+	for directory in ${data_file_directories[@]}; do
+		DATADIR="$directory"
+		SFILES=`ls -1 -d $DATADIR/*/*/snapshots/$SNAME`
+	
+		for f in $SFILES
+		do
+			file="$cluster_name/week_$WEEKOFYEAR/$HOSTNAME$f"
+			$AWSCLI s3 sync $f s3://${S3_BUCKET}/$file
+		done
+
+		#Clear incremental backup files; These are not important after snapshot
+		BFILES=`ls -1 -d $DATADIR/*/*/backups/`
+		for f in $BFILES
+		do
+        		#echo "Clear $f"
+        		rm -f $f*
+		done
+	done
+
+	# Backup Schema
+	CASIP=$(hostname -I)
+	$CQLSH $CASIP -e "DESC KEYSPACES"  > /tmp/schemas.txt
+	
+	for keyspace in $(cat /tmp/schemas.txt); do
+        	$CQLSH $CASIP -e "DESC KEYSPACE  $keyspace" > "/tmp/$keyspace.cql"
+		$AWSCLI s3 cp /tmp/$keyspace.cql s3://$S3_BUCKET/$cluster_name/week_$WEEKOFYEAR/$keyspace.cql
+	done
+
+
+	#Backup tokens
+	$NODETOOL ring | grep $CASIP | awk '{print $NF ", "}' | xargs > /tmp/tokens.txt
+	$AWSCLI s3 cp /tmp/tokens.txt s3://$S3_BUCKET/$cluster_name/week_$WEEKOFYEAR/$HOSTNAME/tokens.txt
+}
+
+function copy_backups() {
+
+	#Run nodetool flush to flush memtables to disk before taking backup
+
+	$NODETOOL flush
+
+	#Parse cassandra configs to extract info on data directories. In our env, we've multiple data directories
+        eval $( parse_yaml "$CASSANDRA_CONFIG" )
+	for directory in ${data_file_directories[@]}; do
+		BFILES=`ls -1 -d $directory/*/*/backups/`
+		for f in $BFILES
+                do
+			file="$cluster_name/week_$WEEKOFYEAR/$HOSTNAME$f"
+			#echo "uploading $f"
+			$AWSCLI s3 sync $f s3://$S3_BUCKET/$file --delete
+                done
+	done
+}
+
 CASSANDRA_CONFIG="/etc/cassandra/cassandra.yaml"
-SCHEMA_FILE="/tmp/keyspace_name_schema.cql"
+DATE=$(date +%Y%m%d%H%M%S)
+DAY=$(date ++%Y%m%d)
+DAYOFWEEK=$(date +%u)
+WEEKOFYEAR=$(date +%V)
+HOSTNAME=$(hostname)
 
-if [ ! -d "$BACKUP_SNAPSHOT_DIR" ]; then
-        echo "Directory $BACKUP_SNAPSHOT_DIR not found, creating..."
-        mkdir -p $BACKUP_SNAPSHOT_DIR
+SNAME="snapshot-$DATE"
+NODETOOL=$(which nodetool)
+CQLSH=$(which cqlsh)
+AWSCLI="/usr/local/bin/aws"
+S3_BUCKET="tc-cassandra"
+
+if [ "${DAYOFWEEK}" -eq 1 ]; then
+	take_snapshot
+else 
+	copy_backups
 fi
-
-if [ ! -d "$BACKUP_SCHEMA_DIR" ]; then
-        echo "Directory $BACKUP_SCHEMA_DIR not found, exit..."
-	mkdir -p $BACKUP_SCHEMA_DIR
-fi
-
-echo "Snapshot name: $SNAME"
-#Clear previous snapshots before taking a new one
-nodetool -h 127.0.0.1 clearsnapshot
-
-if [[ $? != 0 ]]; then
-        echo "Can't clear snapshots"
-        exit
-fi
- 
-# Take a snapshot
-nodetool -h 127.0.0.1 snapshot -t $SNAME
-
-if [[ $? != 0 ]]; then
-        echo "Can't take snapshots"
-        exit
-fi
-
-#Parse cassandra configs to extract info on data directories. In our env, we've multiple data directories
-eval $( parse_yaml "$CASSANDRA_CONFIG" )
-
-for directory in ${data_file_directories[@]}; do
-	DATADIR="$directory"
-	SFILES=`ls -1 -d $DATADIR/*/*/snapshots/$SNAME`
-
-	#Move snapshot files
-	for f in $SFILES
-	do
-        	#echo "Process snapshot $f"
-        	TABLE=`echo $f | awk -F/ '{print $(NF-2)}'`
-        	KEYSPACE=`echo $f | awk -F/ '{print $(NF-3)}'`
- 
-         	if [ ! -d "$BACKUP_SNAPSHOT_DIR/$SNAME/$KEYSPACE/$TABLE" ] ; then
-			mkdir -p $BACKUP_SNAPSHOT_DIR/$SNAME/$KEYSPACE/$TABLE
-		fi
-        	find $f -maxdepth 1 -type f -exec mv -t $BACKUP_SNAPSHOT_DIR/$SNAME/$KEYSPACE/$TABLE/ {} +
-	done
-
-	#Clear backup files; Old backup files are not important after snapshot
-	BFILES=`ls -1 -d $DATADIR/*/*/backups/`
-	for f in $BFILES
-	do
-        	#echo "Clear $f"
-        	rm -f $f*
-	done
-done
-
-
-#Schema backup now
-
-## List All Keyspaces
-cqlsh -e "DESC KEYSPACES"  > $SCHEMA_FILE
-
-if [ ! -d "$BACKUP_SCHEMA_DIR/$SCHEMA_NAME" ]; then
-	mkdir -p $BACKUP_SCHEMA_DIR/$SCHEMA_NAME
-fi
-
-## Take SCHEMA Backup - All Keyspace and All tables
-for keyspace in $(cat $SCHEMA_FILE); do
-	cqlsh -e "DESC KEYSPACE  $keyspace" > "$BACKUP_SCHEMA_DIR/$SCHEMA_NAME/$keyspace.cql"
-done
